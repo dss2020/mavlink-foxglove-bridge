@@ -1,0 +1,11 @@
+[project]
+name = "mavlink-foxglove-bridge"
+version = "0.1.0"
+description = "Bridge MAVLink messages from Serial/UDP to Foxglove for 3D and Map visualization"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "foxglove-sdk>=0.21.0",
+    "pymavlink>=2.4.41",
+    "pyserial>=3.5",
+]
