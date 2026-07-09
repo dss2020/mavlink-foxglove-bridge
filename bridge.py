@@ -217,6 +217,50 @@ def time_boot_ms_to_timestamp(time_boot_ms: int) -> Timestamp:
 
 
 # ---------------------------------------------------------------------------
+# GPS Projection helper (Equirectangular approximation)
+# ---------------------------------------------------------------------------
+
+class GpsProjector:
+    """Project GPS coordinates to local ENU coordinates relative to a common origin."""
+
+    def __init__(self) -> None:
+        self.lat0_rad: float | None = None
+        self.lon0_rad: float | None = None
+        self.alt0: float | None = None
+
+    def project(self, lat_deg: float, lon_deg: float, alt_m: float) -> tuple[float, float, float]:
+        lat_rad = math.radians(lat_deg)
+        lon_rad = math.radians(lon_deg)
+
+        if self.lat0_rad is None:
+            self.lat0_rad = lat_rad
+            self.lon0_rad = lon_rad
+            self.alt0 = alt_m
+            LOGGER.info(f"Set GPS local origin to lat={lat_deg:.6f}, lon={lon_deg:.6f}, alt={alt_m:.2f}m")
+
+        r_earth = 6378137.0
+        d_lat = lat_rad - self.lat0_rad
+        d_lon = lon_rad - self.lon0_rad
+
+        x = d_lon * r_earth * math.cos(self.lat0_rad)
+        y = d_lat * r_earth
+        z = alt_m - self.alt0
+        return x, y, z
+
+
+# ---------------------------------------------------------------------------
+# UAV State Cache
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UavState:
+    sys_id: int
+    last_position: Vector3 = field(default_factory=lambda: Vector3(x=0.0, y=0.0, z=0.0))
+    last_orientation: Quaternion = field(default_factory=lambda: Quaternion(w=1.0, x=0.0, y=0.0, z=0.0))
+    has_gps: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
 
@@ -227,13 +271,17 @@ class MavlinkFoxgloveBridge:
         self._config = config
         self._stats = BridgeStats()
 
-        # Well-known Foxglove channels (created once)
-        self._pose_channel = PoseInFrameChannel("/uav/pose")
+        # Dynamic Foxglove channels by System ID
+        self._pose_channels: dict[int, PoseInFrameChannel] = {}
+        self._gps_channels: dict[int, LocationFixChannel] = {}
         self._tf_channel = FrameTransformChannel("/tf")
-        self._gps_channel = LocationFixChannel("/uav/gps")
 
         # Raw JSON channels (created lazily)
         self._json_channels: dict[str, Channel] = {}
+
+        # UAV State and GPS projection
+        self._uav_states: dict[int, UavState] = {}
+        self._gps_projector = GpsProjector()
 
     # -- public entry point -------------------------------------------------
 
@@ -258,9 +306,11 @@ class MavlinkFoxgloveBridge:
         try:
             self._reconnect_loop()
         finally:
-            self._pose_channel.close()
             self._tf_channel.close()
-            self._gps_channel.close()
+            for ch in self._pose_channels.values():
+                ch.close()
+            for ch in self._gps_channels.values():
+                ch.close()
             for ch in self._json_channels.values():
                 ch.close()
             server.stop()
@@ -297,7 +347,7 @@ class MavlinkFoxgloveBridge:
         LOGGER.info("Waiting for heartbeat...")
         conn.wait_heartbeat()
         LOGGER.info(
-            "Heartbeat received (system %d, component %d)",
+            "First heartbeat received (system %d, component %d)",
             conn.target_system,
             conn.target_component,
         )
@@ -313,79 +363,122 @@ class MavlinkFoxgloveBridge:
                 continue
 
             msg_type = msg.get_type()
+            sys_id = msg.get_srcSystem()
             self._stats.messages_received += 1
 
+            if sys_id not in self._uav_states:
+                self._uav_states[sys_id] = UavState(sys_id=sys_id)
+                LOGGER.info("Discovered new UAV with System ID: %d", sys_id)
+
             try:
-                self._dispatch(msg_type, msg)
+                self._dispatch(msg_type, msg, sys_id)
                 self._stats.messages_published += 1
             except Exception as exc:
                 self._stats.parse_errors += 1
-                LOGGER.warning("Failed to process %s: %s", msg_type, exc)
+                LOGGER.warning("Failed to process %s from UAV %d: %s", msg_type, sys_id, exc)
 
             self._maybe_report_stats()
 
     # -- message dispatch ---------------------------------------------------
 
-    def _dispatch(self, msg_type: str, msg: object) -> None:
+    def _dispatch(self, msg_type: str, msg: object, sys_id: int) -> None:
         if msg_type == "ATTITUDE":
-            self._handle_attitude(msg)
+            self._handle_attitude(msg, sys_id)
         elif msg_type == "GLOBAL_POSITION_INT":
-            self._handle_global_position(msg)
+            self._handle_global_position(msg, sys_id)
         elif msg_type == "GPS_RAW_INT":
-            self._handle_gps_raw(msg)
+            self._handle_gps_raw(msg, sys_id)
         elif msg_type == "HEARTBEAT":
-            self._handle_heartbeat(msg)
+            self._handle_heartbeat(msg, sys_id)
 
     # -- ATTITUDE -> PoseInFrame + FrameTransform ---------------------------
 
-    def _handle_attitude(self, msg: object) -> None:
+    def _handle_attitude(self, msg: object, sys_id: int) -> None:
         ts = time_boot_ms_to_timestamp(msg.time_boot_ms)
         orientation = euler_ned_to_quaternion_enu(msg.roll, msg.pitch, msg.yaw)
 
+        state = self._uav_states[sys_id]
+        state.last_orientation = orientation
+
+        # Get or create PoseInFrame channel for this UAV
+        pose_ch = self._pose_channels.get(sys_id)
+        if pose_ch is None:
+            pose_ch = PoseInFrameChannel(f"/uav_{sys_id}/pose")
+            self._pose_channels[sys_id] = pose_ch
+            LOGGER.info("Advertising PoseInFrame topic: %s", pose_ch.topic)
+
         # Publish PoseInFrame for the 3D panel
-        self._pose_channel.log(
+        pose_ch.log(
             PoseInFrame(
                 timestamp=ts,
-                frame_id="uav",
+                frame_id=f"uav_{sys_id}",
                 pose=Pose(
-                    position=Vector3(x=0.0, y=0.0, z=0.0),
-                    orientation=orientation,
+                    position=state.last_position,
+                    orientation=state.last_orientation,
                 ),
             ),
         )
 
-        # Publish FrameTransform so the 3D panel can render the UAV frame
+        # Publish FrameTransform so the 3D panel can render the UAV frame relative to world
         self._tf_channel.log(
             FrameTransform(
                 timestamp=ts,
                 parent_frame_id="world",
-                child_frame_id="uav",
-                translation=Vector3(x=0.0, y=0.0, z=0.0),
-                rotation=orientation,
+                child_frame_id=f"uav_{sys_id}",
+                translation=state.last_position,
+                rotation=state.last_orientation,
             ),
         )
 
     # -- GLOBAL_POSITION_INT -> LocationFix + raw JSON ----------------------
 
-    def _handle_global_position(self, msg: object) -> None:
+    def _handle_global_position(self, msg: object, sys_id: int) -> None:
         ts = time_boot_ms_to_timestamp(msg.time_boot_ms)
+        lat_deg = msg.lat / 1e7
+        lon_deg = msg.lon / 1e7
+        alt_m = msg.alt / 1e3
+
+        # Project absolute latitude, longitude, and altitude to local ENU coordinates
+        x, y, z = self._gps_projector.project(lat_deg, lon_deg, alt_m)
+
+        state = self._uav_states[sys_id]
+        state.last_position = Vector3(x=x, y=y, z=z)
+        state.has_gps = True
+
+        # Get or create LocationFix channel for this UAV
+        gps_ch = self._gps_channels.get(sys_id)
+        if gps_ch is None:
+            gps_ch = LocationFixChannel(f"/uav_{sys_id}/gps")
+            self._gps_channels[sys_id] = gps_ch
+            LOGGER.info("Advertising LocationFix topic: %s", gps_ch.topic)
 
         # Foxglove LocationFix for the Map panel
-        self._gps_channel.log(
+        gps_ch.log(
             LocationFix(
                 timestamp=ts,
-                latitude=msg.lat / 1e7,
-                longitude=msg.lon / 1e7,
-                altitude=msg.alt / 1e3,
+                latitude=lat_deg,
+                longitude=lon_deg,
+                altitude=alt_m,
+            ),
+        )
+
+        # Publish FrameTransform to update position immediately
+        self._tf_channel.log(
+            FrameTransform(
+                timestamp=ts,
+                parent_frame_id="world",
+                child_frame_id=f"uav_{sys_id}",
+                translation=state.last_position,
+                rotation=state.last_orientation,
             ),
         )
 
         # Also publish as flat JSON for plotting individual fields
-        self._publish_json("mavlink/global_position", {
+        self._publish_json(f"mavlink/uav_{sys_id}/global_position", {
             "time_boot_ms": msg.time_boot_ms,
-            "lat_deg": msg.lat / 1e7,
-            "lon_deg": msg.lon / 1e7,
-            "alt_m": msg.alt / 1e3,
+            "lat_deg": lat_deg,
+            "lon_deg": lon_deg,
+            "alt_m": alt_m,
             "relative_alt_m": msg.relative_alt / 1e3,
             "vx_m_s": msg.vx / 100.0,
             "vy_m_s": msg.vy / 100.0,
@@ -395,8 +488,8 @@ class MavlinkFoxgloveBridge:
 
     # -- GPS_RAW_INT -> raw JSON --------------------------------------------
 
-    def _handle_gps_raw(self, msg: object) -> None:
-        self._publish_json("mavlink/gps_raw", {
+    def _handle_gps_raw(self, msg: object, sys_id: int) -> None:
+        self._publish_json(f"mavlink/uav_{sys_id}/gps_raw", {
             "time_usec": msg.time_usec,
             "fix_type": msg.fix_type,
             "lat_deg": msg.lat / 1e7,
@@ -410,12 +503,12 @@ class MavlinkFoxgloveBridge:
 
     # -- HEARTBEAT -> raw JSON ----------------------------------------------
 
-    def _handle_heartbeat(self, msg: object) -> None:
+    def _handle_heartbeat(self, msg: object, sys_id: int) -> None:
         self._stats.heartbeats += 1
 
         armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
-        self._publish_json("mavlink/heartbeat", {
+        self._publish_json(f"mavlink/uav_{sys_id}/heartbeat", {
             "type": msg.type,
             "autopilot": msg.autopilot,
             "base_mode": msg.base_mode,
@@ -440,11 +533,12 @@ class MavlinkFoxgloveBridge:
         if not self._stats.needs_report():
             return
         LOGGER.info(
-            "msgs_rx=%d msgs_pub=%d heartbeats=%d errors=%d",
+            "msgs_rx=%d msgs_pub=%d heartbeats=%d errors=%d uavs_tracked=%d",
             self._stats.messages_received,
             self._stats.messages_published,
             self._stats.heartbeats,
             self._stats.parse_errors,
+            len(self._uav_states),
         )
 
 
